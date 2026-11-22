@@ -1,0 +1,19 @@
+# Optional local infrastructure for the gated real-backend suite. Nothing in the
+# default `npm test` path needs it, and CI runs its own ElasticMQ service
+# container. See GUIDELINES_NEST_SQS.md, "Local Full-Mode Verification".
+#
+#   npm run infra:up     start ElasticMQ and wait until it answers
+#   npm run test:full    unit suite + the gated suite (fails on any skip)
+#   npm run infra:down   remove the container
+services:
+  elasticmq:
+    # The image CI tests against; pick another line with
+    # `ELASTICMQ_IMAGE=softwaremill/elasticmq-native:<tag> npm run infra:up`.
+    image: ${ELASTICMQ_IMAGE:-softwaremill/elasticmq-native:1.7.1}
+    container_name: nest-sqs-elasticmq
+    # Clients set `endpoint`, so requests go here whatever host and port the
+    # queue URLs ElasticMQ returns carry.
+    ports:
+      - '127.0.0.1:19324:9324'
+    # The native image is distroless (no shell), so it has no health check;
+    # `infra:up` waits for it from the host with scripts/wait-for-sqs.mjs.

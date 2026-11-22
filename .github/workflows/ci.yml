@@ -1,0 +1,364 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  package-build:
+    name: Package build/typecheck (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build --workspace @nest-native/sqs
+
+      - name: Typecheck package
+        run: npm run typecheck --workspace @nest-native/sqs
+
+  package-test-node-22:
+    name: Package tests/coverage (Node 22)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:cov
+
+  package-quality:
+    name: Tests, coverage, and complexity (Node 22)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore base branch CI data
+        if: github.event_name == 'pull_request'
+        id: base-ci-data
+        uses: actions/cache/restore@v6
+        with:
+          path: ci-data
+          key: ci-data-node-22-${{ github.base_ref }}-
+          restore-keys: ci-data-node-22-${{ github.base_ref }}-
+
+      - name: Extract base CI data
+        if: steps.base-ci-data.outputs.cache-matched-key
+        run: |
+          cp ci-data/coverage-summary.json base-coverage-summary.json 2>/dev/null || true
+          cp ci-data/test-results.json base-test-results.json 2>/dev/null || true
+          cp ci-data/test-step-duration-ms.txt base-test-step-duration-ms.txt 2>/dev/null || true
+          cp ci-data/cognitive-complexity-summary.json base-cognitive-complexity-summary.json 2>/dev/null || true
+
+      - name: Run tests with coverage
+        run: |
+          START=$SECONDS
+          npm run test:cov
+          echo $(( (SECONDS - START) * 1000 )) > test-step-duration-ms.txt
+
+      - name: Enforce cognitive complexity threshold
+        run: npm run complexity:check
+
+      - name: Generate cognitive complexity report
+        run: npm run complexity:report
+
+      - name: Generate base cognitive complexity fallback
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f base-cognitive-complexity-summary.json ]; then
+            exit 0
+          fi
+
+          BASE_DIR="$(mktemp -d)"
+          cleanup() {
+            git worktree remove --force "$BASE_DIR" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          git worktree add --detach "$BASE_DIR" "${{ github.event.pull_request.base.sha }}"
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$BASE_DIR/node_modules"
+          # The base tree runs against THIS PR's node_modules, so a PR that
+          # changes the complexity tooling itself cannot produce a baseline.
+          # That is a missing comparison, not a broken build: the report step
+          # already renders fine without a base.
+          (
+            cd "$BASE_DIR"
+            if [ -f scripts/collect-cognitive-complexity.mjs ]; then
+              node scripts/collect-cognitive-complexity.mjs \
+                --output "$GITHUB_WORKSPACE/base-cognitive-complexity-summary.json"
+            fi
+          ) || {
+            echo "::notice::Base complexity report unavailable (tooling changed since the base commit); reporting without a baseline."
+            rm -f "$GITHUB_WORKSPACE/base-cognitive-complexity-summary.json"
+          }
+
+      - name: Cache CI data for base branch
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p ci-data
+          cp coverage/coverage-summary.json ci-data/coverage-summary.json
+          cp test-results.json ci-data/test-results.json
+          cp test-step-duration-ms.txt ci-data/test-step-duration-ms.txt
+          cp complexity/cognitive-complexity-summary.json ci-data/cognitive-complexity-summary.json
+
+      - if: github.event_name == 'push'
+        uses: actions/cache/save@v6
+        with:
+          path: ci-data
+          key: ci-data-node-22-${{ github.ref_name }}-${{ github.sha }}
+
+      - name: Get changed files
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'packages/**/*.ts' | tee changed-files.txt
+
+      - name: Coverage Report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const report = require('./.github/scripts/coverage-report.js');
+            await report({ github, context, core });
+
+      - name: Performance Report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const report = require('./.github/scripts/performance-report.js');
+            await report({ github, context, core });
+
+      - name: Complexity Report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const report = require('./.github/scripts/complexity-report.js');
+            await report({ github, context, core });
+
+      - name: Coverage and performance summary
+        run: |
+          node -e "
+          const fs = require('node:fs');
+          const summary = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8')).total;
+          const duration = fs.readFileSync('test-step-duration-ms.txt', 'utf8').trim();
+          const metrics = {
+            statements: summary.statements.pct,
+            branches: summary.branches.pct,
+            functions: summary.functions.pct,
+            lines: summary.lines.pct,
+          };
+          const report = [
+            '### Package Quality',
+            '',
+            '| Metric | Value |',
+            '| :--- | ---: |',
+            '| Statements | ' + metrics.statements + '% |',
+            '| Branches | ' + metrics.branches + '% |',
+            '| Functions | ' + metrics.functions + '% |',
+            '| Lines | ' + metrics.lines + '% |',
+            '| Test step duration | ' + duration + ' ms |',
+          ].join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report + '\n');
+          "
+
+      - name: Upload quality artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-quality
+          path: |
+            coverage/coverage-summary.json
+            coverage/lcov.info
+            complexity/cognitive-complexity-summary.json
+            test-results.json
+            test-step-duration-ms.txt
+          if-no-files-found: error
+  nestjs-compat:
+    name: NestJS ${{ matrix.nest.label }} compatibility (Node 22)
+    runs-on: ubuntu-latest
+    # The published peer range is @nestjs/* ^11 || ^12. The devDependencies and
+    # the lockfile every other job installs stay on 11.x, so this matrix makes
+    # the two ENDS of the range tested claims: each leg installs one end on top
+    # of the lockfile with --no-save, proves the tree it got, and runs the unit
+    # suite and the package build against it. The unit suite holds the shutdown
+    # decision (the drain in beforeApplicationShutdown finishes before any
+    # onApplicationShutdown), so it runs on both majors here.
+    strategy:
+      fail-fast: false
+      matrix:
+        nest:
+          # 11.0.0 is the oldest graph the published range can produce. Pinned
+          # exactly, so a downgrade that silently no-ops cannot pass as a floor
+          # run; @nestjs/testing moves in lockstep with core.
+          - { label: '11 floor', spec: '11.0.0' }
+          # ^12.0.0 floats, so a new 12.x patch is tested on the next run.
+          - { label: '12', spec: '^12.0.0' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install NestJS ${{ matrix.nest.label }} (this job only, never saved)
+        run: |
+          npm install --no-save --workspaces --include-workspace-root \
+            "@nestjs/common@${{ matrix.nest.spec }}" \
+            "@nestjs/core@${{ matrix.nest.spec }}" \
+            "@nestjs/testing@${{ matrix.nest.spec }}"
+
+      - name: Prove every workspace resolves NestJS ${{ matrix.nest.label }}
+        run: node scripts/check-nestjs-resolution.mjs "${{ matrix.nest.spec }}"
+
+      - name: Run the unit suite against NestJS ${{ matrix.nest.label }}
+        run: npm test
+
+      - name: Build the package against NestJS ${{ matrix.nest.label }}
+        run: npm run build --workspace @nest-native/sqs
+
+  aws-sdk-floor:
+    name: '@aws-sdk/client-sqs floor (3.600.0) compatibility (Node 22)'
+    runs-on: ubuntu-latest
+    # The published peer range is @aws-sdk/client-sqs ^3.600.0 — the floor of
+    # @ssut/nestjs-sqs 3.0.1, so migrating needs no SDK upgrade. The lockfile
+    # carries a recent 3.x; this leg pins the floor exactly and runs the unit
+    # suite (the driver specs build real SDK commands) and the build on it. The
+    # integration job runs the real-endpoint suite on both ends as well.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install @aws-sdk/client-sqs 3.600.0 (this job only, never saved)
+        run: |
+          npm install --no-save --workspaces --include-workspace-root "@aws-sdk/client-sqs@3.600.0"
+          node -e "console.log('@aws-sdk/client-sqs', require('@aws-sdk/client-sqs/package.json').version)"
+
+      - name: Run the unit suite against the SDK floor
+        run: npm test
+
+      - name: Build the package against the SDK floor
+        run: npm run build --workspace @nest-native/sqs
+
+  release-and-security:
+    name: Release and security checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate package tarball
+        run: npm run release:check
+
+      - name: Audit production supply chain
+        run: npm run security:audit
+
+  integration:
+    name: Real-backend integration (ElasticMQ ${{ matrix.elasticmq }}, SDK ${{ matrix.sdk.label }})
+    runs-on: ubuntu-latest
+    # A request on a dead connection could wait for a long time; fail instead.
+    timeout-minutes: 15
+    # The gated specs (packages/sqs/test/integration) against a real SQS
+    # endpoint: the semantics contract that also runs against InMemorySqs, and a
+    # Nest application end to end. They skip when SQS_ENDPOINT is unset so forks
+    # stay green, which is why this job runs them through
+    # test:integration:strict: it fails if any spec or suite did not run, so a
+    # wiring mistake cannot pass as green.
+    #
+    # ElasticMQ, not LocalStack: LocalStack needs an auth token since 2026.03.0,
+    # and a secret cannot reach the fork PRs this gate must cover.
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ElasticMQ line the suite is tested against. Add the 2.0.x line
+        # when it is generally available (2.0.0-rc1 shipped 2026-11-08).
+        elasticmq: ['1.7.1']
+        sdk:
+          # The lockfile's @aws-sdk/client-sqs, and the published floor.
+          - { label: lockfile, spec: '' }
+          - { label: floor, spec: '3.600.0' }
+    services:
+      elasticmq:
+        image: softwaremill/elasticmq-native:${{ matrix.elasticmq }}
+        ports:
+          - 9324:9324
+        # The native image is distroless (no shell), so it carries no
+        # --health-cmd; the job waits for it from the runner below.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install @aws-sdk/client-sqs ${{ matrix.sdk.spec }} (this job only, never saved)
+        if: matrix.sdk.spec != ''
+        run: npm install --no-save --workspaces --include-workspace-root "@aws-sdk/client-sqs@${{ matrix.sdk.spec }}"
+
+      - name: Wait for ElasticMQ to answer ListQueues
+        run: node scripts/wait-for-sqs.mjs http://localhost:9324
+
+      - name: Run the gated specs (fails on any skip)
+        env:
+          SQS_ENDPOINT: http://localhost:9324
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: npm run test:integration:strict
+
+      - name: Dump ElasticMQ logs on failure
+        if: failure()
+        run: docker logs "${{ job.services.elasticmq.id }}" || true
+
+  # The sample matrix and the Docusaurus site arrive with milestone 2, with
+  # their jobs (samples, docs-site) and the deploy-docs workflow.

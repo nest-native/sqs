@@ -1,0 +1,60 @@
+version: 2
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+      include: "scope"
+    groups:
+      dev-tooling-minor-patch:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@aws-sdk/*"
+      # @aws-sdk/client-sqs ships almost daily (twelve releases between
+      # 2026-11-06 and 2026-11-21); one weekly group keeps that to one PR.
+      aws-sdk:
+        patterns:
+          - "@aws-sdk/*"
+      # Majors are grouped deliberately, not just minors and patches. The
+      # @nestjs/* packages peer on each other, so a major that arrives
+      # one-package-per-PR produces a tree npm refuses to install. Grouped, a
+      # major arrives as one PR that can be evaluated; it is adopted by widening
+      # the peer range (GUIDELINES_NEST_SQS.md §1), not by merging the PR.
+      nest-sqs-peer:
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
+        patterns:
+          - "@nestjs/common"
+          - "@nestjs/core"
+          - "@nestjs/testing"
+          - "class-validator"
+          - "reflect-metadata"
+          - "rxjs"
+          - "zod"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+      include: "scope"

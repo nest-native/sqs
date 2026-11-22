@@ -27,8 +27,21 @@ export function containsInvalidSqsCharacter(text: string): boolean {
   return INVALID_CHARACTER.test(text);
 }
 
-/** `MessageGroupId` and `MessageDeduplicationId`: 1 to 128 printable ASCII. */
-const GROUP_OR_DEDUPLICATION_ID = /^[\x21-\x7E]{1,128}$/;
+/**
+ * `MessageGroupId`, `MessageDeduplicationId` and `ReceiveRequestAttemptId`: 1
+ * to 128 letters, digits and ASCII punctuation (printable ASCII but the space).
+ */
+const SQS_IDENTIFIER = /^[\x21-\x7E]{1,128}$/;
+
+/**
+ * Whether `value` is a valid `MessageGroupId`, `MessageDeduplicationId` or
+ * `ReceiveRequestAttemptId`.
+ *
+ * @internal
+ */
+export function isSqsIdentifier(value: string): boolean {
+  return SQS_IDENTIFIER.test(value);
+}
 
 /** Attribute names: letters, digits, `_`, `-` and `.`, up to 256. */
 const ATTRIBUTE_NAME = /^[A-Za-z0-9_.-]{1,256}$/;
@@ -127,7 +140,7 @@ function validateFifoFields(entry: SqsSendEntry, fifo: boolean): void {
     ['groupId', entry.messageGroupId],
     ['deduplicationId', entry.messageDeduplicationId],
   ] as const) {
-    if (value !== undefined && !GROUP_OR_DEDUPLICATION_ID.test(value)) {
+    if (value !== undefined && !isSqsIdentifier(value)) {
       throw new SqsMessageValidationError(
         `${field} must be 1 to 128 characters of letters, digits and ASCII punctuation.`,
       );

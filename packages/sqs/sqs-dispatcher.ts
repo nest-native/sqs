@@ -4,16 +4,11 @@ import { SQS_MAX_VISIBILITY_SECONDS } from './constants';
 import { SqsReceivedMessage } from './driver';
 import { SqsContext, SqsMessageControl, SqsQueueInfo } from './sqs-context';
 import { SqsErrorBehavior, SqsErrorMapper } from './sqs-error-mapping';
+import { remainingVisibilitySeconds, SqsHeartbeat, SqsHeartbeatBeat } from './sqs-heartbeat';
 import { parseSqsBody } from './sqs-message-codec';
 import { SqsPermits } from './sqs-permits';
 import { retryDelaySeconds, SqsRetryBackoffOptions } from './sqs-retry-backoff';
 import { SqsSettler } from './sqs-settler';
-
-/**
- * Seconds kept in reserve below the 12-hour budget, for the time between our
- * receive and SQS's clock.
- */
-const VISIBILITY_BUDGET_MARGIN_SECONDS = 30;
 
 /**
  * What a handler runner receives for one message: the parsed body and its
@@ -36,6 +31,8 @@ export interface SqsDispatcherOptions {
   permits: SqsPermits;
   clock: SqsClock;
   logger: LoggerService;
+  /** Extends the visibility of every held message; unset when it is off. */
+  heartbeat?: SqsHeartbeat;
   random?: () => number;
 }
 
@@ -44,6 +41,10 @@ interface Delivery {
   readonly receiptHandle: string;
   readonly receivedAt: number;
   readonly abort: AbortController;
+  /** FIFO queues only: the message group whose chain the message is in. */
+  readonly group?: string;
+  /** Its visibility heartbeat, from receive to settle; unset when the heartbeat is off. */
+  readonly beat?: SqsHeartbeatBeat;
   /** Deleted (automatically or with `ctx.delete()`) or retried: nothing more to do. */
   settled: boolean;
   /** Released at the end of the shutdown drain: its outcome is ignored. */
@@ -58,41 +59,88 @@ interface Delivery {
  * message's visibility to the backoff for its receive count — never below one
  * second — so a failing message is not redelivered in a tight loop.
  *
+ * On a FIFO queue, the messages of one group run one at a time, in receive
+ * order, each after its predecessor settled; different groups run
+ * concurrently. The messages waiting behind a running one stay held, each with
+ * its permit and its heartbeat. A `'retry'` holds the group: once the failed
+ * message's new visibility is set, the group's later held messages are
+ * released (visibility 0), so SQS redelivers the failed message first. A
+ * delete SQS refuses does the same, since the message is still in the queue.
+ *
  * @internal
  */
 export class SqsDispatcher {
-  private readonly inFlight = new Map<Delivery, Promise<void>>();
+  /** Every held message: waiting in a group chain, running, or being settled. */
+  private readonly held = new Set<Delivery>();
+  /** The messages whose handler started, until they are settled. */
+  private readonly running = new Map<Delivery, Promise<void>>();
+  /** FIFO queues only: each group's held messages in receive order; the first one runs. */
+  private readonly chains = new Map<string, Delivery[]>();
 
   constructor(private readonly options: SqsDispatcherOptions) {}
 
+  /** How many messages are held. */
   get size(): number {
-    return this.inFlight.size;
-  }
-
-  /** Run one message. It owns one permit, given back once it is settled. */
-  dispatch(message: SqsReceivedMessage): void {
-    const delivery: Delivery = {
-      message,
-      receiptHandle: message.ReceiptHandle as string,
-      receivedAt: this.options.clock.now(),
-      abort: new AbortController(),
-      settled: false,
-      abandoned: false,
-    };
-    const work = this.process(delivery).finally(() => {
-      this.inFlight.delete(delivery);
-      this.options.permits.give(1);
-    });
-    this.inFlight.set(delivery, work);
+    return this.held.size;
   }
 
   /**
-   * Wait up to `timeoutMs` for the messages in flight. Those still running then
-   * are abandoned: their `signal` aborts and they are released (visibility 0),
-   * so another consumer picks them up at once.
+   * Take one received message. It owns one permit, given back once it is
+   * settled. On a FIFO queue it runs once every earlier held message of its
+   * group has settled.
+   */
+  dispatch(message: SqsReceivedMessage): void {
+    const receiptHandle = message.ReceiptHandle as string;
+    const receivedAt = this.options.clock.now();
+    const delivery: Delivery = {
+      message,
+      receiptHandle,
+      receivedAt,
+      abort: new AbortController(),
+      group: this.options.queue.isFifo ? (message.Attributes?.MessageGroupId ?? '') : undefined,
+      beat: this.options.heartbeat?.start({ messageId: message.MessageId ?? '', receiptHandle, receivedAt }),
+      settled: false,
+      abandoned: false,
+    };
+    this.held.add(delivery);
+    if (delivery.group === undefined) {
+      this.start(delivery);
+      return;
+    }
+    const chain = this.chains.get(delivery.group);
+    if (chain) {
+      chain.push(delivery);
+      return;
+    }
+    this.chains.set(delivery.group, [delivery]);
+    this.start(delivery);
+  }
+
+  /**
+   * Release every held message whose handler has not started — on a FIFO
+   * queue, the messages waiting behind a running one of their group — with
+   * visibility 0, so another consumer can take them at once. The first step of
+   * the shutdown drain.
+   */
+  async releaseWaiting(): Promise<void> {
+    const waiting = [...this.chains.values()].flatMap(chain => chain.splice(1));
+    if (waiting.length === 0) {
+      return;
+    }
+    this.options.logger.log(
+      `Releasing ${waiting.length} message(s) on "${this.options.queue.key}" that were waiting behind an ` +
+        'earlier message of their group.',
+    );
+    await this.release(waiting);
+  }
+
+  /**
+   * Wait up to `timeoutMs` for the messages being handled. Those still running
+   * then are abandoned: their `signal` aborts and they are released
+   * (visibility 0), so another consumer picks them up at once.
    */
   async drain(timeoutMs: number): Promise<void> {
-    const pending = [...this.inFlight.values()];
+    const pending = [...this.running.values()];
     if (pending.length === 0) {
       return;
     }
@@ -100,7 +148,7 @@ export class SqsDispatcher {
       return;
     }
     // A message whose delete or retry is already under way is finishing, not stuck.
-    const stragglers = [...this.inFlight.keys()].filter(delivery => !delivery.settled);
+    const stragglers = [...this.running.keys()].filter(delivery => !delivery.settled);
     if (stragglers.length === 0) {
       return;
     }
@@ -111,7 +159,30 @@ export class SqsDispatcher {
     for (const delivery of stragglers) {
       delivery.abandoned = true;
       delivery.abort.abort();
-      void this.options.settler.changeVisibility(delivery.receiptHandle, 0);
+    }
+    await Promise.all(stragglers.map(delivery => this.setVisibility(delivery, 0)));
+  }
+
+  private start(delivery: Delivery): void {
+    const work = this.process(delivery).finally(() => this.complete(delivery));
+    this.running.set(delivery, work);
+  }
+
+  /** A running message settled: give its permit back and run the next of its group. */
+  private complete(delivery: Delivery): void {
+    this.running.delete(delivery);
+    this.held.delete(delivery);
+    this.options.permits.give(1);
+    if (delivery.group === undefined) {
+      return;
+    }
+    const chain = this.chains.get(delivery.group) as Delivery[];
+    chain.shift();
+    const next = chain[0];
+    if (next) {
+      this.start(next);
+    } else {
+      this.chains.delete(delivery.group);
     }
   }
 
@@ -135,8 +206,13 @@ export class SqsDispatcher {
     delivery.settled = true;
     if (outcome === 'retry') {
       await this.retry(delivery, context.getReceiveCount());
+      await this.releaseSuccessors(delivery);
     } else {
-      await this.options.settler.delete(delivery.receiptHandle);
+      await delivery.beat?.stop();
+      if (!(await this.options.settler.delete(delivery.receiptHandle))) {
+        // SQS still has the message and will deliver it again: nothing of its group may run first.
+        await this.releaseSuccessors(delivery);
+      }
     }
   }
 
@@ -158,12 +234,14 @@ export class SqsDispatcher {
     return behavior;
   }
 
+  /** Set the backoff as the message's visibility; without a backoff, leave it alone. */
   private async retry(delivery: Delivery, receiveCount: number): Promise<void> {
+    await delivery.beat?.stop();
     const backoff = this.options.retryBackoff;
     if (!backoff) {
       return;
     }
-    const remaining = this.remainingBudgetSeconds(delivery);
+    const remaining = remainingVisibilitySeconds(this.options.clock, delivery.receivedAt);
     if (remaining < 1) {
       return;
     }
@@ -171,10 +249,39 @@ export class SqsDispatcher {
     await this.options.settler.changeVisibility(delivery.receiptHandle, Math.min(delay, remaining));
   }
 
-  /** What is left of the 12 hours SQS allows a received message, in seconds. */
-  private remainingBudgetSeconds(delivery: Delivery): number {
-    const elapsed = Math.ceil((this.options.clock.now() - delivery.receivedAt) / 1000);
-    return SQS_MAX_VISIBILITY_SECONDS - elapsed - VISIBILITY_BUDGET_MARGIN_SECONDS;
+  /**
+   * FIFO queues only: release the messages held behind a retried one in its
+   * group, or behind one whose delete SQS refused, so none of them runs before
+   * SQS redelivers it. Called once the message's visibility is set or its
+   * delete answered: SQS then holds the group until that message is visible
+   * again, and serves it first.
+   */
+  private async releaseSuccessors(delivery: Delivery): Promise<void> {
+    if (delivery.group === undefined) {
+      return;
+    }
+    // The chain exists while its first message runs; the retried message is that one.
+    const successors = (this.chains.get(delivery.group) as Delivery[]).splice(1);
+    if (successors.length > 0) {
+      await this.release(successors);
+    }
+  }
+
+  /** Release held messages that never ran (visibility 0) and give their permits back. */
+  private async release(deliveries: Delivery[]): Promise<void> {
+    await Promise.all(
+      deliveries.map(async delivery => {
+        await this.setVisibility(delivery, 0);
+        this.held.delete(delivery);
+        this.options.permits.give(1);
+      }),
+    );
+  }
+
+  /** Stop the message's heartbeat, then set its visibility. */
+  private async setVisibility(delivery: Delivery, seconds: number): Promise<boolean> {
+    await delivery.beat?.stop();
+    return this.options.settler.changeVisibility(delivery.receiptHandle, seconds);
   }
 
   private control(delivery: Delivery): SqsMessageControl {
@@ -184,7 +291,9 @@ export class SqsDispatcher {
           return;
         }
         delivery.settled = true;
+        await delivery.beat?.stop();
         if (!(await this.options.settler.delete(delivery.receiptHandle))) {
+          await this.releaseSuccessors(delivery);
           throw new Error(`SQS did not delete message ${delivery.message.MessageId}.`);
         }
       },
@@ -192,7 +301,7 @@ export class SqsDispatcher {
         if (!Number.isInteger(seconds) || seconds < 0 || seconds > SQS_MAX_VISIBILITY_SECONDS) {
           throw new RangeError(`A visibility timeout is an integer from 0 to ${SQS_MAX_VISIBILITY_SECONDS} seconds.`);
         }
-        if (!(await this.options.settler.changeVisibility(delivery.receiptHandle, seconds))) {
+        if (!(await this.setVisibility(delivery, seconds))) {
           throw new Error(`SQS did not change the visibility of message ${delivery.message.MessageId}.`);
         }
       },

@@ -55,6 +55,46 @@ export interface SqsConsumerOptions {
    * queue's own `VisibilityTimeout` applies; it is read once at bootstrap.
    */
   visibilityTimeout?: number;
+
+  /**
+   * The visibility heartbeat: while the consumer holds a message — running its
+   * handler, or, on a FIFO queue, waiting behind an earlier message of its
+   * group — it extends the message's visibility, so the message does not
+   * become visible to other consumers in the middle of its processing.
+   * `false` turns it off.
+   *
+   * It needs the visibility timeout: when the queue's attributes cannot be
+   * read and `visibilityTimeout` is not set, the heartbeat is off, with one
+   * warning, and so it is when the visibility timeout is 0 or 1 second, too
+   * short to extend in time.
+   *
+   * @default {} (on, with the defaults of {@link SqsHeartbeatOptions})
+   */
+  heartbeat?: SqsHeartbeatOptions | false;
+}
+
+/**
+ * When the visibility heartbeat extends a held message, and by how much. The
+ * first extension comes `intervalSeconds` after the receive, so a handler that
+ * finishes sooner costs no call. No extension passes the 12 hours SQS allows
+ * from a receive: the one that reaches that limit is the last, with a warning.
+ */
+export interface SqsHeartbeatOptions {
+  /**
+   * Seconds between two extensions of one held message. It must be shorter
+   * than the visibility timeout and than `extendBySeconds`.
+   *
+   * @default max(1, floor(visibility timeout / 2))
+   */
+  intervalSeconds?: number;
+
+  /**
+   * The visibility timeout each extension sets, counted from the extension
+   * (1 to 43 200 seconds).
+   *
+   * @default the consumer's visibility timeout
+   */
+  extendBySeconds?: number;
 }
 
 /**

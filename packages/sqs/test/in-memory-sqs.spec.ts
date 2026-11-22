@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { systemClock } from '../clock';
 import { InMemorySqs, InMemorySqsError } from '../testing/in-memory-sqs';
@@ -25,10 +26,9 @@ describe('InMemorySqs queues', () => {
     assert.equal(new InMemorySqs().createQueue('q'), 'http://sqs.in-memory.test/000000000000/q');
   });
 
-  it('refuses invalid names, FIFO queues and invalid attributes', () => {
+  it('refuses invalid names and invalid attributes', () => {
     const { sqs } = setup();
     assert.throws(() => sqs.createQueue('bad name'), { name: 'InvalidParameterValue', message: /not a valid queue name/ });
-    assert.throws(() => sqs.createQueue('ledger.fifo'), /FIFO queues are not modeled/);
     assert.throws(() => sqs.createQueue('q', { Policy: '{}' } as never), { name: 'InvalidAttributeName' });
     for (const attributes of [
       { VisibilityTimeout: '43201' },
@@ -378,5 +378,296 @@ describe('InMemorySqs permissions and idleness', () => {
     sqs.createQueue('orders');
     sqs.sendMessage('orders', 'x');
     assert.equal((await receive(sqs, 'orders')).length, 1);
+  });
+});
+
+describe('InMemorySqs FIFO queues', () => {
+  const FIFO = { FifoQueue: 'true' };
+
+  async function receiveFifo(sqs: InMemorySqs, queue: string, maxMessages = 10, visibilityTimeout?: number) {
+    const messages = await sqs.createDriver().receiveMessages({
+      queueUrl: sqs.queueUrl(queue),
+      maxMessages,
+      waitTimeSeconds: 0,
+      visibilityTimeout,
+      receiveRequestAttemptId: 'attempt-1',
+    });
+    return messages;
+  }
+
+  const bodies = (messages: { Body?: string }[]) => messages.map(message => message.Body);
+
+  it('creates FIFO queues, and refuses the names and attributes SQS refuses', async () => {
+    const { sqs, driver } = setup({ autoCreateQueues: true });
+    const url = sqs.createQueue('ledger.fifo', FIFO);
+    assert.equal(url, 'http://sqs.in-memory.test/000000000000/ledger.fifo');
+    assert.deepEqual(await driver.getQueueAttributes(url, ['FifoQueue', 'ContentBasedDeduplication']), {
+      FifoQueue: 'true',
+      ContentBasedDeduplication: 'false',
+    });
+    const dedup = sqs.createQueue('dedup.fifo', { FifoQueue: 'true', ContentBasedDeduplication: 'true' });
+    assert.equal((await driver.getQueueAttributes(dedup, ['All'])).ContentBasedDeduplication, 'true');
+    const standard = sqs.createQueue('plain', { FifoQueue: 'false' });
+    assert.deepEqual(await driver.getQueueAttributes(standard, ['FifoQueue', 'ContentBasedDeduplication']), {});
+    assert.equal(sqs.createQueue(`${'x'.repeat(75)}.fifo`, FIFO).endsWith('.fifo'), true);
+
+    assert.throws(() => sqs.createQueue('orders.fifo'), {
+      name: 'InvalidParameterValue',
+      message: /not a valid queue name: .*\(a FIFO queue needs the FifoQueue attribute set to 'true'\)/,
+    });
+    for (const name of ['ledger', `${'x'.repeat(76)}.fifo`, 'le dger.fifo', '.fifo']) {
+      assert.throws(() => sqs.createQueue(name, FIFO), { name: 'InvalidParameterValue', message: /not a valid FIFO queue name/ });
+    }
+    assert.throws(() => sqs.createQueue('q', { FifoQueue: 'yes' }), { name: 'InvalidAttributeValue' });
+    assert.throws(() => sqs.createQueue('c.fifo', { FifoQueue: 'true', ContentBasedDeduplication: 'on' }), {
+      name: 'InvalidAttributeValue',
+    });
+    assert.throws(() => sqs.createQueue('q', { ContentBasedDeduplication: 'true' }), {
+      name: 'InvalidAttributeName',
+      message: 'Unknown Attribute ContentBasedDeduplication.',
+    });
+
+    const auto = await driver.getQueueUrl('auto.fifo');
+    assert.deepEqual(await driver.getQueueAttributes(auto, ['FifoQueue']), { FifoQueue: 'true' });
+  });
+
+  it('refuses each FIFO send SQS refuses, entry by entry, with its code', async () => {
+    const { sqs, driver } = setup();
+    const url = sqs.createQueue('ledger.fifo', FIFO);
+    const outcome = await driver.sendMessages(url, [
+      { id: 'nogroup', body: 'x', messageDeduplicationId: 'd1' },
+      { id: 'nodedup', body: 'x', messageGroupId: 'g' },
+      { id: 'delay', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd2', delaySeconds: 5 },
+      { id: 'zerodelay', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd3', delaySeconds: 0 },
+      { id: 'badgroup', body: 'x', messageGroupId: 'a b', messageDeduplicationId: 'd4' },
+      { id: 'longgroup', body: 'x', messageGroupId: 'g'.repeat(129), messageDeduplicationId: 'd5' },
+      { id: 'baddedup', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd'.repeat(129) },
+      { id: 'empty', body: '', messageGroupId: 'g', messageDeduplicationId: 'd6' },
+      { id: 'fine', body: 'x', messageGroupId: '!"#$%&()*+,-./:;<=>?@[]^_`{|}~', messageDeduplicationId: 'd7' },
+    ]);
+    assert.deepEqual(
+      outcome.failed.map(failure => `${failure.id}:${failure.code}`),
+      [
+        'nogroup:MissingParameter',
+        'nodedup:InvalidParameterValue',
+        'delay:InvalidParameterValue',
+        'zerodelay:InvalidParameterValue',
+        'badgroup:InvalidParameterValue',
+        'longgroup:InvalidParameterValue',
+        'baddedup:InvalidParameterValue',
+        'empty:InvalidMessageContents',
+      ],
+    );
+    assert.match(String(outcome.failed[1].message), /either have ContentBasedDeduplication enabled or MessageDeduplicationId/);
+    assert.deepEqual(
+      outcome.successful.map(success => success.id),
+      ['fine'],
+    );
+    assert.throws(() => sqs.sendMessage('ledger.fifo', 'x', { deduplicationId: 'd8' }), { name: 'MissingParameter' });
+
+    const standard = sqs.createQueue('orders');
+    const fair = await driver.sendMessages(standard, [{ id: 'bad', body: 'x', messageGroupId: 'a b' }]);
+    assert.equal(fair.failed[0].code, 'InvalidParameterValue', 'a fair-queue group id follows the same rule');
+  });
+
+  it('deduplicates a send within 5 minutes by its id, even once the first message is gone', async () => {
+    const { sqs, driver, clock } = setup();
+    const url = sqs.createQueue('ledger.fifo', FIFO);
+    const first = sqs.sendMessage('ledger.fifo', 'one', { groupId: 'g', deduplicationId: 'same' });
+    const again = await driver.sendMessages(url, [
+      { id: 'a', body: 'two', messageGroupId: 'g', messageDeduplicationId: 'same' },
+      { id: 'b', body: 'three', messageGroupId: 'h', messageDeduplicationId: 'same' },
+    ]);
+    assert.deepEqual(
+      again.successful.map(success => success.messageId),
+      [first, first],
+      'accepted, with the first message id, whatever the group',
+    );
+    assert.equal(again.successful[0].sequenceNumber, sqs.messages('ledger.fifo')[0].sequenceNumber);
+    const [message] = await receiveFifo(sqs, 'ledger.fifo');
+    assert.equal(message.Body, 'one');
+    assert.equal(message.Attributes?.MessageDeduplicationId, 'same');
+    await driver.deleteMessages(url, [{ id: '0', receiptHandle: message.ReceiptHandle as string }]);
+    assert.equal(sqs.sendMessage('ledger.fifo', 'four', { groupId: 'g', deduplicationId: 'same' }), first);
+    assert.deepEqual(sqs.messages('ledger.fifo'), []);
+
+    await clock.advance(5 * 60 * 1000 - 1);
+    sqs.sendMessage('ledger.fifo', 'five', { groupId: 'g', deduplicationId: 'same' });
+    sqs.sendMessage('ledger.fifo', 'six', { groupId: 'g', deduplicationId: 'other' });
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo')), ['six'], 'still within the window');
+
+    await clock.advance(1);
+    const fresh = sqs.sendMessage('ledger.fifo', 'seven', { groupId: 'h', deduplicationId: 'same' });
+    assert.notEqual(fresh, first, 'the window closed 5 minutes after the first send');
+    assert.equal(sqs.sendMessage('ledger.fifo', 'eight', { groupId: 'h', deduplicationId: 'other' }), sqs.messages('ledger.fifo')[0].messageId);
+  });
+
+  it('deduplicates by the SHA-256 of the body on a queue with content-based deduplication', async () => {
+    const { sqs } = setup();
+    sqs.createQueue('events.fifo', { FifoQueue: 'true', ContentBasedDeduplication: 'true' });
+    const first = sqs.sendMessage('events.fifo', 'body', { groupId: 'g' });
+    assert.equal(sqs.sendMessage('events.fifo', 'body', { groupId: 'g', attributes: { type: 'other' } }), first, 'attributes do not count');
+    const explicit = sqs.sendMessage('events.fifo', 'body', { groupId: 'g', deduplicationId: 'explicit' });
+    assert.notEqual(explicit, first, 'an explicit id wins over the body');
+    const [state] = sqs.messages('events.fifo');
+    assert.equal(state.deduplicationId, createHash('sha256').update('body').digest('hex'));
+    assert.equal(sqs.messages('events.fifo').length, 2);
+  });
+
+  it('numbers every FIFO message with an increasing 20-digit sequence number, on the send and on the receive', async () => {
+    const { sqs, driver } = setup();
+    const url = sqs.createQueue('ledger.fifo', FIFO);
+    const sent = await driver.sendMessages(url, [
+      { id: 'a', body: 'one', messageGroupId: 'g', messageDeduplicationId: '1' },
+      { id: 'b', body: 'two', messageGroupId: 'h', messageDeduplicationId: '2' },
+    ]);
+    const numbers = sent.successful.map(success => success.sequenceNumber as string);
+    assert.ok(numbers.every(number => /^\d{20}$/.test(number)));
+    assert.ok(BigInt(numbers[0]) < BigInt(numbers[1]));
+    assert.ok(BigInt(numbers[1]) - BigInt(numbers[0]) > 1n, 'not consecutive, as SQS warns');
+
+    const received = await receiveFifo(sqs, 'ledger.fifo');
+    assert.deepEqual(
+      received.map(message => [message.Body, message.Attributes?.MessageGroupId, message.Attributes?.SequenceNumber]),
+      [
+        ['one', 'g', numbers[0]],
+        ['two', 'h', numbers[1]],
+      ],
+    );
+    assert.deepEqual(
+      sqs.messages('ledger.fifo').map(state => [state.groupId, state.deduplicationId, state.sequenceNumber]),
+      [
+        ['g', '1', numbers[0]],
+        ['h', '2', numbers[1]],
+      ],
+    );
+    const plain = sqs.createQueue('orders');
+    const standard = await driver.sendMessages(plain, [{ id: 'a', body: 'x' }]);
+    assert.equal(standard.successful[0].sequenceNumber, undefined);
+    assert.equal('groupId' in sqs.messages('orders')[0], false);
+  });
+
+  it('returns as many messages of one group as it can, in order, before the next group', async () => {
+    const { sqs } = setup();
+    sqs.createQueue('ledger.fifo', FIFO);
+    for (const [body, groupId] of [
+      ['a1', 'a'],
+      ['b1', 'b'],
+      ['a2', 'a'],
+      ['b2', 'b'],
+      ['a3', 'a'],
+    ]) {
+      sqs.sendMessage('ledger.fifo', body, { groupId, deduplicationId: body });
+    }
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo', 2)), ['a1', 'a2']);
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo')), ['b1', 'b2'], 'a3 waits behind a1 and a2 in flight');
+    assert.deepEqual(await receiveFifo(sqs, 'ledger.fifo'), []);
+  });
+
+  it('holds a group behind its first invisible message, and serves the group again from its head', async () => {
+    const { sqs, driver, clock } = setup();
+    const url = sqs.createQueue('ledger.fifo', { FifoQueue: 'true', VisibilityTimeout: '30' });
+    for (const body of ['g1', 'g2', 'g3']) {
+      sqs.sendMessage('ledger.fifo', body, { groupId: 'g', deduplicationId: body });
+    }
+    const [g1] = await receiveFifo(sqs, 'ledger.fifo', 1);
+    assert.equal(g1.Body, 'g1');
+    assert.deepEqual(await receiveFifo(sqs, 'ledger.fifo'), [], 'g2 and g3 wait while g1 is in flight');
+    sqs.sendMessage('ledger.fifo', 'h1', { groupId: 'h', deduplicationId: 'h1' });
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo')), ['h1'], 'another group is served');
+
+    await driver.changeVisibility(url, [{ id: '0', receiptHandle: g1.ReceiptHandle as string, visibilityTimeout: 0 }]);
+    const held = await receiveFifo(sqs, 'ledger.fifo');
+    assert.deepEqual(bodies(held), ['g1', 'g2', 'g3'], 'a released head comes back first, with the rest of its group');
+
+    // The retry flow: the failed head gets its backoff, then the rest are released.
+    await driver.changeVisibility(url, [{ id: '0', receiptHandle: held[0].ReceiptHandle as string, visibilityTimeout: 2 }]);
+    await driver.changeVisibility(
+      url,
+      held.slice(1).map((message, index) => ({
+        id: String(index),
+        receiptHandle: message.ReceiptHandle as string,
+        visibilityTimeout: 0,
+      })),
+    );
+    assert.deepEqual(await receiveFifo(sqs, 'ledger.fifo'), [], 'the group waits for its head');
+    await clock.advance(2_000);
+    const again = await receiveFifo(sqs, 'ledger.fifo');
+    assert.deepEqual(bodies(again), ['g1', 'g2', 'g3'], 'the head first, then the rest, in order');
+    assert.deepEqual(
+      again.map(message => message.Attributes?.ApproximateReceiveCount),
+      ['3', '2', '2'],
+    );
+
+    // A released head is served even while a later message of its group is in flight.
+    await driver.changeVisibility(url, [{ id: '0', receiptHandle: again[0].ReceiptHandle as string, visibilityTimeout: 0 }]);
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo')), ['g1']);
+  });
+
+  it('holds a group behind a delayed message, and wakes a long poll when the group frees up', async () => {
+    const { sqs, driver, clock } = setup();
+    const url = sqs.createQueue('slow.fifo', { FifoQueue: 'true', DelaySeconds: '5' });
+    sqs.sendMessage('slow.fifo', 'd1', { groupId: 'g', deduplicationId: 'd1' });
+    assert.deepEqual(await receiveFifo(sqs, 'slow.fifo'), []);
+    await clock.advance(5_000);
+    const [d1] = await receiveFifo(sqs, 'slow.fifo');
+    sqs.sendMessage('slow.fifo', 'd2', { groupId: 'g', deduplicationId: 'd2' });
+    await clock.advance(5_000);
+
+    const polling = driver.receiveMessages({
+      queueUrl: url,
+      maxMessages: 10,
+      waitTimeSeconds: 20,
+      receiveRequestAttemptId: 'poll',
+    });
+    await flush();
+    await driver.deleteMessages(url, [{ id: '0', receiptHandle: d1.ReceiptHandle as string }]);
+    assert.deepEqual(bodies(await polling), ['d2']);
+  });
+
+  it('checks ReceiveRequestAttemptId, which only FIFO queues take', async () => {
+    const { sqs, driver } = setup();
+    const fifo = sqs.createQueue('ledger.fifo', FIFO);
+    const standard = sqs.createQueue('orders');
+    const receive = (queueUrl: string, receiveRequestAttemptId: string) =>
+      driver.receiveMessages({ queueUrl, maxMessages: 1, waitTimeSeconds: 0, receiveRequestAttemptId });
+    await assert.rejects(receive(standard, 'x'), { name: 'InvalidParameterValue', message: /not valid for this queue type/ });
+    await assert.rejects(receive(fifo, 'a b'), { name: 'InvalidParameterValue', message: /ReceiveRequestAttemptId can only include/ });
+    await assert.rejects(receive(fifo, 'x'.repeat(129)), { name: 'InvalidParameterValue' });
+    assert.deepEqual(await receive(fifo, randomUUID()), []);
+    await assert.rejects(receive('http://sqs.in-memory.test/000000000000/missing.fifo', 'x'), { name: 'QueueDoesNotExist' });
+  });
+
+  it('moves the head of a group to its dead-letter queue, and serves the next one', async () => {
+    const { sqs, driver } = setup();
+    sqs.createQueue('ledger-dlq.fifo', FIFO);
+    const url = sqs.createQueue('ledger.fifo', {
+      FifoQueue: 'true',
+      RedrivePolicy: JSON.stringify({ deadLetterTargetArn: sqs.queueArn('ledger-dlq.fifo'), maxReceiveCount: 1 }),
+    });
+    sqs.sendMessage('ledger.fifo', 'p1', { groupId: 'p', deduplicationId: 'p1' });
+    sqs.sendMessage('ledger.fifo', 'p2', { groupId: 'p', deduplicationId: 'p2' });
+    const [p1] = await receiveFifo(sqs, 'ledger.fifo', 1);
+    await driver.changeVisibility(url, [{ id: '0', receiptHandle: p1.ReceiptHandle as string, visibilityTimeout: 0 }]);
+    assert.deepEqual(bodies(await receiveFifo(sqs, 'ledger.fifo')), ['p2']);
+    const [dead] = await receiveFifo(sqs, 'ledger-dlq.fifo');
+    assert.equal(dead.Body, 'p1');
+    assert.equal(dead.Attributes?.MessageGroupId, 'p');
+  });
+
+  it('is idle when the visible FIFO messages wait behind one that is invisible', async () => {
+    const { sqs, driver } = setup();
+    const url = sqs.createQueue('ledger.fifo', FIFO);
+    sqs.sendMessage('ledger.fifo', 'g1', { groupId: 'g', deduplicationId: 'g1' });
+    sqs.sendMessage('ledger.fifo', 'g2', { groupId: 'g', deduplicationId: 'g2' });
+    const received = await receiveFifo(sqs, 'ledger.fifo');
+    await driver.changeVisibility(url, [
+      { id: '0', receiptHandle: received[0].ReceiptHandle as string, visibilityTimeout: 5 },
+      { id: '1', receiptHandle: received[1].ReceiptHandle as string, visibilityTimeout: 0 },
+    ]);
+    assert.equal(sqs.messages('ledger.fifo')[1].visible, true);
+    await sqs.idle();
+    sqs.sendMessage('ledger.fifo', 'h1', { groupId: 'h', deduplicationId: 'h1' });
+    await assert.rejects(sqs.idle({ timeoutMs: 10 }), /ledger.fifo: 1 visible, 0 in flight/);
   });
 });

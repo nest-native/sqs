@@ -93,6 +93,20 @@ describe('SqsTestModule', () => {
     await moduleRef.close();
   });
 
+  it('creates a referenced .fifo queue as a FIFO queue', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [SqsTestModule.forRoot({ queues: { ledger: 'ledger.fifo' } })],
+    }).compile();
+    await moduleRef.init();
+    const producer = moduleRef.get(SqsProducerService);
+    const sent = await producer.send('ledger', { body: 'x', groupId: 'g', deduplicationId: 'd' });
+    assert.match(String(sent.sequenceNumber), /^\d{20}$/);
+    assert.deepEqual(await producer.send('ledger', { body: 'y', groupId: 'g', deduplicationId: 'd' }), sent, 'deduplicated');
+    const [message] = moduleRef.get(InMemorySqs).messages('ledger.fifo');
+    assert.equal(message.groupId, 'g');
+    await moduleRef.close();
+  });
+
   it('runs against a supplied InMemorySqs, on its clock, with overridable shutdown options', async () => {
     const sqs = new InMemorySqs();
     const definition = SqsTestModule.forRoot({ sqs, isGlobal: false, shutdown: { abortReceive: false } });

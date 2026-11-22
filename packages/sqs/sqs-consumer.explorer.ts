@@ -94,25 +94,31 @@ export class SqsConsumerExplorer implements OnApplicationBootstrap, BeforeApplic
     const errorMapper = this.options.errorMapper ?? defaultSqsErrorMapper;
     const retryBackoff = resolveRetryBackoff(this.options.retryBackoff);
     const clock = this.options.clock ?? systemClock;
-    const consumers = prepared.map(
-      ({ handler, queue, queueVisibilityTimeout }) =>
-        new SqsQueueConsumer({
-          queue,
-          consumer: resolveConsumerOptions(
-            [this.registry.options(handler.queueKey), handler.metadata.options, this.options.consumerDefaults ?? {}],
-            queueVisibilityTimeout,
-            handler.describe,
-          ),
-          run: handler.run,
-          errorMapper,
-          retryBackoff,
-          clock,
-          logger: this.logger,
-        }),
-    );
-    for (const consumer of consumers) {
-      this.consumers.push(consumer);
-      consumer.start();
+    // Every handler's options are resolved, and validated, before any consumer starts.
+    const resolved = prepared.map(({ handler, queue, queueVisibilityTimeout }) => ({
+      queue,
+      run: handler.run,
+      consumer: resolveConsumerOptions(
+        [this.registry.options(handler.queueKey), handler.metadata.options, this.options.consumerDefaults ?? {}],
+        queueVisibilityTimeout,
+        handler.describe,
+      ),
+    }));
+    for (const { queue, run, consumer } of resolved) {
+      if (consumer.heartbeatOff) {
+        this.logger.warn(`The visibility heartbeat of "${queue.key}" is off: ${consumer.heartbeatOff}.`);
+      }
+      const queueConsumer = new SqsQueueConsumer({
+        queue,
+        consumer,
+        run,
+        errorMapper,
+        retryBackoff,
+        clock,
+        logger: this.logger,
+      });
+      this.consumers.push(queueConsumer);
+      queueConsumer.start();
     }
   }
 
@@ -150,12 +156,6 @@ export class SqsConsumerExplorer implements OnApplicationBootstrap, BeforeApplic
       queue = await this.registry.resolve(handler.queueKey);
     } catch (error) {
       throw bootstrapError(handler, `could not resolve the queue "${handler.queueKey}"`, error);
-    }
-    if (queue.isFifo) {
-      throw new Error(
-        `${handler.describe} consumes the FIFO queue "${handler.queueKey}", which this version cannot ` +
-          'consume yet: per-group ordering is not implemented.',
-      );
     }
     return queue;
   }

@@ -3,6 +3,7 @@ import { SqsClock } from './clock';
 import { ResolvedConsumerOptions } from './sqs-consumer-options';
 import { SqsDispatcher, SqsHandlerInvocation } from './sqs-dispatcher';
 import { SqsErrorMapper } from './sqs-error-mapping';
+import { SqsHeartbeat } from './sqs-heartbeat';
 import { SqsPermits } from './sqs-permits';
 import { SqsPoller } from './sqs-poller';
 import { ResolvedSqsQueue } from './sqs-queue-registry';
@@ -22,8 +23,9 @@ export interface SqsQueueConsumerOptions {
 
 /**
  * One queue's consumer: a poller that receives, a dispatcher that runs the
- * handler, and a settler that deletes or changes visibility — sharing one set
- * of permits, so the consumer never holds more messages than its concurrency.
+ * handler, a heartbeat that keeps held messages invisible, and a settler that
+ * deletes or changes visibility — sharing one set of permits, so the consumer
+ * never holds more messages than its concurrency.
  *
  * @internal
  */
@@ -36,6 +38,9 @@ export class SqsQueueConsumer {
     const { queue, consumer, clock, logger } = options;
     const permits = new SqsPermits(consumer.concurrency);
     this.settler = new SqsSettler(queue.driver, queue.url, queue.key, logger);
+    const heartbeat =
+      consumer.heartbeat &&
+      new SqsHeartbeat({ ...consumer.heartbeat, settler: this.settler, clock, logger, queueKey: queue.key });
     this.dispatcher = new SqsDispatcher({
       queue: {
         key: queue.key,
@@ -51,6 +56,7 @@ export class SqsQueueConsumer {
       permits,
       clock,
       logger,
+      heartbeat,
     });
     this.poller = new SqsPoller({
       queue,
@@ -75,11 +81,14 @@ export class SqsQueueConsumer {
   }
 
   /**
-   * Stop receiving, drain what is in flight (releasing whatever outlasts
-   * `drainTimeoutMs`), then send every pending delete and visibility change.
+   * Stop receiving, release the held messages that have not started (FIFO
+   * messages waiting behind an earlier one of their group), drain what is
+   * running (releasing whatever outlasts `drainTimeoutMs`), then send every
+   * pending delete and visibility change.
    */
   async stop(options: { drainTimeoutMs: number; abortReceive: boolean }): Promise<void> {
     await this.poller.stop(options.abortReceive);
+    await this.dispatcher.releaseWaiting();
     await this.dispatcher.drain(options.drainTimeoutMs);
     await this.settler.flush();
   }

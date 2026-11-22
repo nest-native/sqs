@@ -213,6 +213,10 @@ describe('resolveConsumerOptions', () => {
       receiveTimeoutMs: 30_000,
       visibilityTimeout: undefined,
       effectiveVisibilityTimeout: undefined,
+      heartbeat: undefined,
+      heartbeatOff:
+        "the visibility timeout is unknown (the queue's attributes could not be read and visibilityTimeout " +
+        'is not set); set visibilityTimeout to turn it on',
     });
     assert.deepEqual(
       resolveConsumerOptions(
@@ -227,6 +231,8 @@ describe('resolveConsumerOptions', () => {
         receiveTimeoutMs: 15_000,
         visibilityTimeout: 60,
         effectiveVisibilityTimeout: 60,
+        heartbeat: { intervalSeconds: 30, extendBySeconds: 60 },
+        heartbeatOff: undefined,
       },
     );
     assert.equal(resolveConsumerOptions([{}], 45, 'A.handle').effectiveVisibilityTimeout, 45);
@@ -251,5 +257,71 @@ describe('resolveConsumerOptions', () => {
     for (const options of [{ concurrency: 1.5 }, { maxMessages: 0 }, { waitTimeSeconds: 21 }, { visibilityTimeout: -1 }]) {
       assert.throws(() => resolveConsumerOptions([options], undefined, 'A.b'), /Invalid consumer options/);
     }
+  });
+
+  describe('the visibility heartbeat', () => {
+    const heartbeatOf = (layers: Parameters<typeof resolveConsumerOptions>[0], visibility: number | undefined) => {
+      const { heartbeat, heartbeatOff } = resolveConsumerOptions(layers, visibility, 'A.handle');
+      return { heartbeat, heartbeatOff };
+    };
+
+    it('extends by the visibility timeout every half of it, from the option or the queue', () => {
+      assert.deepEqual(heartbeatOf([{}], 30), { heartbeat: { intervalSeconds: 15, extendBySeconds: 30 }, heartbeatOff: undefined });
+      assert.deepEqual(heartbeatOf([{}], 5), { heartbeat: { intervalSeconds: 2, extendBySeconds: 5 }, heartbeatOff: undefined });
+      assert.deepEqual(heartbeatOf([{}], 2), { heartbeat: { intervalSeconds: 1, extendBySeconds: 2 }, heartbeatOff: undefined });
+      assert.deepEqual(heartbeatOf([{ visibilityTimeout: 120 }], 30).heartbeat, { intervalSeconds: 60, extendBySeconds: 120 });
+    });
+
+    it('takes a configured timing, the first layer that sets one winning whole', () => {
+      assert.deepEqual(heartbeatOf([{ heartbeat: { intervalSeconds: 10 } }], 30).heartbeat, {
+        intervalSeconds: 10,
+        extendBySeconds: 30,
+      });
+      assert.deepEqual(heartbeatOf([{ heartbeat: { extendBySeconds: 120 } }], 30).heartbeat, {
+        intervalSeconds: 15,
+        extendBySeconds: 120,
+      });
+      assert.deepEqual(
+        heartbeatOf([{ heartbeat: { intervalSeconds: 5, extendBySeconds: 20 } }, { heartbeat: { intervalSeconds: 1 } }], 30)
+          .heartbeat,
+        { intervalSeconds: 5, extendBySeconds: 20 },
+      );
+    });
+
+    it('is off, without a warning, when turned off', () => {
+      assert.deepEqual(heartbeatOf([{ heartbeat: false }, { heartbeat: { intervalSeconds: 5 } }], 30), {
+        heartbeat: undefined,
+        heartbeatOff: undefined,
+      });
+      assert.deepEqual(heartbeatOf([{ heartbeat: false }], undefined), { heartbeat: undefined, heartbeatOff: undefined });
+    });
+
+    it('is off, with the reason to warn about, when the visibility is unknown or too short to extend', () => {
+      assert.match(String(heartbeatOf([{ heartbeat: { intervalSeconds: 5 } }], undefined).heartbeatOff), /visibility timeout is unknown/);
+      assert.deepEqual(heartbeatOf([{}], 1), {
+        heartbeat: undefined,
+        heartbeatOff: 'the visibility timeout of 1 s is too short to extend',
+      });
+      assert.equal(heartbeatOf([{ visibilityTimeout: 0 }], 30).heartbeatOff, 'the visibility timeout of 0 s is too short to extend');
+    });
+
+    it('refuses a timing that cannot work, or values SQS would refuse', () => {
+      for (const [heartbeat, visibility, problem] of [
+        [{ intervalSeconds: 0 }, 30, /heartbeat.intervalSeconds must be an integer >= 1/],
+        [{ intervalSeconds: 1.5 }, 30, /heartbeat.intervalSeconds must be an integer >= 1/],
+        [{ extendBySeconds: 0 }, 30, /heartbeat.extendBySeconds must be an integer from 1 to 43200/],
+        [{ extendBySeconds: 43_201 }, 30, /heartbeat.extendBySeconds must be an integer from 1 to 43200/],
+        [{ extendBySeconds: 2.5 }, 30, /heartbeat.extendBySeconds must be an integer from 1 to 43200/],
+        [{ intervalSeconds: 30 }, 30, /heartbeat.intervalSeconds \(30\) must be shorter than the visibility timeout \(30 s\) and than heartbeat.extendBySeconds \(30\)/],
+        [{ intervalSeconds: 10, extendBySeconds: 10 }, 60, /must be shorter than/],
+        [{ extendBySeconds: 30 }, 1, /heartbeat.intervalSeconds \(1\) must be shorter than the visibility timeout \(1 s\)/],
+        [{ intervalSeconds: 0 }, undefined, /heartbeat.intervalSeconds must be an integer >= 1/],
+      ] as const) {
+        assert.throws(
+          () => resolveConsumerOptions([{ heartbeat }], visibility, 'Orders.placed'),
+          (error: Error) => error.message.startsWith('Invalid consumer options for Orders.placed: ') && problem.test(error.message),
+        );
+      }
+    });
   });
 });

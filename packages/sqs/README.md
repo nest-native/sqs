@@ -3,9 +3,9 @@
 Decorator-first NestJS integration for Amazon SQS, built directly on
 `@aws-sdk/client-sqs`.
 
-> **Status: `0.1.0` (`0.x`)**, in development and not yet published. FIFO
-> ordering, batch handlers, the visibility heartbeat, the health indicator and
-> the `@nestjs/outbox` transport are the next milestone.
+> **Status: `0.1.0` (`0.x`)**, in development and not yet published. Batch
+> handlers, the handler timeout, the health indicator and the `@nestjs/outbox`
+> transport are the next milestone.
 
 ```bash
 npm i @nest-native/sqs @aws-sdk/client-sqs
@@ -55,6 +55,20 @@ With `endpoint` set, the SDK sends every request there, and its "QueueUrl
 differs from SQSClient resolved endpoint" warning does not appear. The SDK has
 spoken the AWS JSON protocol since `@aws-sdk/client-sqs` 3.446.0, so the
 emulator must too: ElasticMQ from 1.4.0, or LocalStack.
+
+ElasticMQ is not AWS. Where the package's tests found it behaving differently
+from what AWS documents (ElasticMQ 1.7.1):
+
+- `SendMessageBatch` on a FIFO queue returns no `SequenceNumber` (a single
+  `SendMessage` does), so `send()` and `sendBatch()` resolve without one; the
+  received message still carries it. Its sequence numbers are small integers,
+  where AWS's are large (128-bit) and non-consecutive.
+- A receive retried with the same `ReceiveRequestAttemptId` returns the same
+  messages with new receipt handles and a higher receive count; AWS returns the
+  same receipt handles.
+- A FIFO message may carry a per-message `DelaySeconds` of 0; AWS documents
+  that a FIFO queue takes no per-message delay (`SqsProducerService` refuses
+  one either way).
 
 ## Consuming
 
@@ -106,6 +120,7 @@ A handler without parameter decorators receives `(payload, context)`.
 | `waitTimeSeconds` | `20` | the long poll (1–20; short polling is not supported) |
 | `receiveTimeoutMs` | `waitTimeSeconds × 1000 + 10 000` | the deadline of a receive; it is aborted and retried after it |
 | `visibilityTimeout` | the queue's | a per-receive `VisibilityTimeout`, in seconds |
+| `heartbeat` | on | extend held messages' visibility (`{ intervalSeconds, extendBySeconds }`), or `false` |
 
 Set them per queue (`queues.<key>`), on `@SqsHandler(queue, options)`, or in
 `consumerDefaults`; the queue's configuration wins, then the decorator, then the
@@ -167,13 +182,67 @@ no source queue: to redrive it, name the destination.
 
 `ctx.delete()` deletes the message now (the transport then does not delete it
 again, and an error thrown afterwards cannot retry it). `ctx.changeVisibility(s)`
-changes its visibility, counted from now.
+changes its visibility, counted from now, and stops the heartbeat for that
+message: its visibility is the handler's to keep from then on.
+
+### FIFO queues
+
+A queue whose name ends in `.fifo` is consumed in order within each message
+group (`MessageGroupId`):
+
+- the messages of one group run one at a time, in the order SQS returned them:
+  a message starts once the one before it finished and was deleted;
+- different groups run at the same time, up to `concurrency`;
+- a message waiting behind an earlier one of its group still holds one of the
+  `concurrency` slots, from receive to settle. SQS returns as many messages of
+  one group as it can, so when one group dominates the queue, raise
+  `concurrency` to give the others room.
+
+A failure holds its group. On `'retry'`, the failed message gets its backoff
+first, then the messages held behind it are released (visibility 0): SQS keeps
+the group locked while the failed message is invisible, then redelivers it
+before them. With `retryBackoff: false`, the failed message keeps its
+visibility, and the ones behind it are released all the same. On `'delete'`,
+the next message runs. A delete SQS refuses holds the group like a retry: the
+message is still in the queue, so the ones behind it are released and it is
+redelivered first. Other groups are not held either way. A redrive policy
+moves a message that keeps failing out of its group after `maxReceiveCount`
+receives, and the group goes on without it.
+
+Producing to a FIFO queue takes a `groupId`, and a `deduplicationId` unless the
+queue has content-based deduplication (see [Producing](#producing)).
+
+### Visibility heartbeat
+
+While a consumer holds a message — running its handler, or waiting behind an
+earlier message of its FIFO group — the heartbeat extends its visibility, so
+the message does not reappear to other consumers in the middle of its
+processing:
+
+```ts
+SqsModule.forRoot({
+  consumerDefaults: { heartbeat: { intervalSeconds: 15, extendBySeconds: 60 } },
+});
+```
+
+- Every `intervalSeconds` (default: half the visibility timeout, at least 1)
+  each held message gets a new visibility of `extendBySeconds` (default: the
+  visibility timeout), in `ChangeMessageVisibilityBatch` calls. The first
+  extension comes one interval after the receive, so a short handler costs no
+  call.
+- No extension passes the 12 hours SQS allows a message to stay invisible after
+  a receive: the extension that reaches that limit is the last, with a warning.
+- It is on by default, and needs the visibility timeout: when the queue's
+  attributes cannot be read and `visibilityTimeout` is not set, it is off, with
+  one warning; a visibility timeout of 0 or 1 second leaves no room for it
+  either. `heartbeat: false` turns it off.
 
 ### Shutdown
 
 Call `app.enableShutdownHooks()`. In `beforeApplicationShutdown`, each consumer
 stops receiving — waiting for the long poll in flight, at most its deadline,
-and releasing what it returned with visibility 0 — then drains the messages in
+and releasing what it returned with visibility 0 — releases the FIFO messages
+waiting behind an earlier one of their group, then drains the messages in
 flight, for at most `shutdown.drainTimeoutMs` (20 s), releases whatever is still
 running (its `ctx.signal` aborts), and sends every pending delete. NestJS
 finishes this phase in every module before any `onApplicationShutdown` runs, so
@@ -229,7 +298,23 @@ await (sqs.clock as VirtualClock).advance(2_000); // let a retry's visibility ex
 per receive (an older one deletes nothing), receive counts, redrive to a
 dead-letter queue, long polling, the 12-hour budget — and refuses every argument
 SQS refuses, with SQS's error code. It runs on a `VirtualClock`, so a test moves
-time instead of sleeping. FIFO queues are not modeled yet.
+time instead of sleeping.
+
+FIFO queues keep each group in order and locked while an earlier message of it
+is in flight, deduplicate sends for 5 minutes (by `deduplicationId`, or by the
+body's SHA-256 with `ContentBasedDeduplication`), and number every message.
+`SqsTestModule` creates a `.fifo` name as a FIFO queue; for other attributes,
+create the queue yourself and pass the instance:
+
+```ts
+const sqs = new InMemorySqs();
+sqs.createQueue('ledger.fifo', { FifoQueue: 'true', ContentBasedDeduplication: 'true' });
+// SqsTestModule.forRoot({ sqs, queues: { ledger: 'ledger.fifo' } })
+sqs.sendMessage('ledger.fifo', JSON.stringify(entry), { groupId: entry.accountId });
+```
+
+`idle()` counts a heartbeat's extension as a new visibility, like any other: a
+test that moves the clock while a handler runs should wait for that handler.
 
 ## IAM
 
@@ -254,6 +339,8 @@ The batch operations need no permission of their own.
 | `batchSize` | `concurrency` (and `maxMessages`); the default stays 1 |
 | `waitTimeSeconds`, `visibilityTimeout` | the same names |
 | `terminateVisibilityTimeout` | `retryBackoff` |
+| `heartbeatInterval` | `heartbeat: { intervalSeconds }`; on by default, within the 12-hour budget |
+| `suppressFifoWarning` | not needed: FIFO queues are consumed in order per message group |
 | `messageAttributeNames`, `attributeNames` | every attribute is always requested |
 | `pollingCompleteWaitTimeMs`, `stopOptions` | `shutdown.drainTimeoutMs`, `shutdown.abortReceive` |
 | `@SqsMessageHandler(name)` | `@SqsHandler(name)` |

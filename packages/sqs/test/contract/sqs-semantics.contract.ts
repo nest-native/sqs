@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { before, describe, it } from 'node:test';
 import { SqsDriver, SqsReceivedMessage } from '../../driver';
 
@@ -20,7 +20,12 @@ export interface SqsContractBackend {
  * (ElasticMQ in CI) in the gated suite. When the two disagree, the test double
  * is what is wrong — that is the point of running one spec on both.
  *
- * Visibility timeouts are a second or two, so a real run takes seconds.
+ * Visibility timeouts are a second or two, so a real run takes seconds. The
+ * 5-minute end of the FIFO deduplication window is asserted on `InMemorySqs`
+ * only (its unit spec), because a real endpoint would take 5 minutes.
+ *
+ * Where ElasticMQ and AWS disagree, these assertions state what both do; the
+ * README of the package lists what ElasticMQ does differently.
  */
 export function sqsSemanticsContract(
   label: string,
@@ -51,6 +56,41 @@ export function sqsSemanticsContract(
       const outcome = await backend.driver.sendMessages(queueUrl, [{ id: '0', body }]);
       assert.deepEqual(outcome.failed, []);
       return outcome.successful[0].messageId;
+    }
+
+    function createFifoQueue(prefix: string, attributes: Record<string, string> = {}): Promise<string> {
+      return backend.createQueue(`${name(prefix)}.fifo`, { FifoQueue: 'true', ...attributes });
+    }
+
+    /** A FIFO receive, with a `ReceiveRequestAttemptId` as the consumer sends one. */
+    function receiveFifo(queueUrl: string, maxMessages = 10): Promise<SqsReceivedMessage[]> {
+      return backend.driver.receiveMessages({
+        queueUrl,
+        maxMessages,
+        waitTimeSeconds: 0,
+        receiveRequestAttemptId: randomUUID(),
+      });
+    }
+
+    async function sendFifo(queueUrl: string, body: string, groupId: string, deduplicationId?: string): Promise<string> {
+      const outcome = await backend.driver.sendMessages(queueUrl, [
+        { id: '0', body, messageGroupId: groupId, messageDeduplicationId: deduplicationId },
+      ]);
+      assert.deepEqual(outcome.failed, []);
+      return outcome.successful[0].messageId;
+    }
+
+    const bodies = (messages: SqsReceivedMessage[]): (string | undefined)[] => messages.map(message => message.Body);
+
+    function releaseAll(queueUrl: string, messages: SqsReceivedMessage[]) {
+      return backend.driver.changeVisibility(
+        queueUrl,
+        messages.map((message, index) => ({
+          id: String(index),
+          receiptHandle: message.ReceiptHandle as string,
+          visibilityTimeout: 0,
+        })),
+      );
     }
 
     it('resolves a queue URL by name, and refuses an unknown name with QueueDoesNotExist', async () => {
@@ -176,6 +216,156 @@ export function sqsSemanticsContract(
       const dead = await receiveOne(dlq);
       assert.equal(dead.MessageId, id);
       assert.equal(dead.Body, 'poison');
+    });
+
+    it('keeps a FIFO group in send order, and holds it while one of its messages is in flight', async () => {
+      const url = await createFifoQueue('contract-fifo', { VisibilityTimeout: '30' });
+      const sent = await backend.driver.sendMessages(
+        url,
+        ['g1', 'g2', 'g3'].map((body, index) => ({
+          id: String(index),
+          body,
+          messageGroupId: 'g',
+          messageDeduplicationId: body,
+        })),
+      );
+      assert.deepEqual(sent.failed, []);
+
+      const [g1, ...none] = await receiveFifo(url, 1);
+      assert.deepEqual(none, []);
+      assert.equal(g1.Body, 'g1', 'the oldest message of the group first');
+      assert.equal(g1.Attributes?.MessageGroupId, 'g');
+      assert.equal(g1.Attributes?.MessageDeduplicationId, 'g1');
+      assert.match(String(g1.Attributes?.SequenceNumber), /^\d+$/);
+      assert.deepEqual(await receiveFifo(url), [], 'the rest of the group waits while g1 is in flight');
+
+      await sendFifo(url, 'h1', 'h', 'h1');
+      const [h1] = await receiveFifo(url);
+      assert.equal(h1.Body, 'h1', 'another group is served meanwhile');
+      await sendFifo(url, 'h2', 'h', 'h2');
+      assert.deepEqual(await receiveFifo(url), []);
+      await backend.driver.deleteMessages(url, [{ id: '0', receiptHandle: h1.ReceiptHandle as string }]);
+      assert.deepEqual(bodies(await receiveFifo(url)), ['h2'], 'deleting h1 lets h2 through');
+
+      // A released head comes back first, with the rest of its group, in order, in one receive.
+      await releaseAll(url, [g1]);
+      const group = await receiveFifo(url);
+      assert.deepEqual(bodies(group), ['g1', 'g2', 'g3']);
+      const sequence = group.map(message => BigInt(message.Attributes?.SequenceNumber as string));
+      assert.ok(sequence[0] < sequence[1] && sequence[1] < sequence[2], 'sequence numbers grow with the send order');
+
+      // A retry: the head gets its backoff first, then the rest are released. The group waits for its head.
+      await backend.driver.changeVisibility(url, [
+        { id: '0', receiptHandle: group[0].ReceiptHandle as string, visibilityTimeout: 1 },
+      ]);
+      const released = await releaseAll(url, group.slice(1));
+      assert.deepEqual(released.failed, []);
+      assert.deepEqual(await receiveFifo(url), [], 'the released messages wait behind their head');
+      await backend.wait(1_600);
+      const again = await receiveFifo(url);
+      assert.deepEqual(bodies(again), ['g1', 'g2', 'g3']);
+      assert.deepEqual(
+        again.map(message => message.Attributes?.ApproximateReceiveCount),
+        ['3', '2', '2'],
+      );
+    });
+
+    it('keeps FIFO messages in flight, and their group locked, for as long as their visibility is extended', async () => {
+      const url = await createFifoQueue('contract-fifo-extend', { VisibilityTimeout: '1' });
+      await sendFifo(url, 'e1', 'e', 'e1');
+      await sendFifo(url, 'e2', 'e', 'e2');
+      const held = await receiveFifo(url);
+      assert.deepEqual(bodies(held), ['e1', 'e2']);
+
+      // What the heartbeat does for a running message and the one waiting behind it.
+      await backend.wait(500);
+      const extended = await backend.driver.changeVisibility(
+        url,
+        held.map((message, index) => ({
+          id: String(index),
+          receiptHandle: message.ReceiptHandle as string,
+          visibilityTimeout: 2,
+        })),
+      );
+      assert.deepEqual(extended.failed, []);
+      await backend.wait(1_100);
+      assert.deepEqual(await receiveFifo(url), [], 'past their first visibility timeout, both are still in flight');
+      await backend.wait(1_200);
+      assert.deepEqual(bodies(await receiveFifo(url)), ['e1', 'e2'], 'and visible again once the extension ran out');
+    });
+
+    it('accepts a FIFO send that repeats a deduplication id within 5 minutes, and does not deliver it', async () => {
+      const url = await createFifoQueue('contract-dedup');
+      const first = await sendFifo(url, 'one', 'g', 'same');
+      const repeated = await backend.driver.sendMessages(url, [
+        { id: '0', body: 'two', messageGroupId: 'g', messageDeduplicationId: 'same' },
+        { id: '1', body: 'three', messageGroupId: 'h', messageDeduplicationId: 'same' },
+      ]);
+      assert.deepEqual(repeated.failed, []);
+      assert.deepEqual(
+        repeated.successful.map(success => success.messageId),
+        [first, first],
+        "the first message's id, whatever the group",
+      );
+
+      const received = await receiveFifo(url);
+      assert.deepEqual(bodies(received), ['one']);
+      await backend.driver.deleteMessages(url, [{ id: '0', receiptHandle: received[0].ReceiptHandle as string }]);
+      assert.equal(await sendFifo(url, 'four', 'g', 'same'), first);
+      assert.deepEqual(await receiveFifo(url), [], 'the window outlives the message');
+    });
+
+    it('deduplicates by the SHA-256 of the body on a queue with content-based deduplication', async () => {
+      const url = await createFifoQueue('contract-content', { ContentBasedDeduplication: 'true' });
+      assert.deepEqual(await backend.driver.getQueueAttributes(url, ['FifoQueue', 'ContentBasedDeduplication']), {
+        FifoQueue: 'true',
+        ContentBasedDeduplication: 'true',
+      });
+      const first = await sendFifo(url, 'body', 'g');
+      const withAttributes = await backend.driver.sendMessages(url, [
+        {
+          id: '0',
+          body: 'body',
+          messageGroupId: 'g',
+          messageAttributes: { type: { DataType: 'String', StringValue: 'other' } },
+        },
+      ]);
+      assert.equal(withAttributes.successful[0].messageId, first, 'attributes are not part of the hash');
+      await sendFifo(url, 'body', 'g', 'explicit');
+
+      const received = await receiveFifo(url);
+      assert.deepEqual(
+        received.map(message => message.Attributes?.MessageDeduplicationId),
+        [createHash('sha256').update('body').digest('hex'), 'explicit'],
+        'an explicit deduplication id wins over the body',
+      );
+    });
+
+    it('refuses a FIFO message without a group, without a deduplication id, or with its own delay', async () => {
+      const url = await createFifoQueue('contract-fifo-rules');
+      const outcome = await backend.driver.sendMessages(url, [
+        { id: 'nogroup', body: 'x', messageDeduplicationId: 'd1' },
+        { id: 'nodedup', body: 'x', messageGroupId: 'g' },
+        { id: 'delay', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd2', delaySeconds: 5 },
+        { id: 'badgroup', body: 'x', messageGroupId: 'a b', messageDeduplicationId: 'd3' },
+        { id: 'baddedup', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd'.repeat(129) },
+        { id: 'fine', body: 'x', messageGroupId: 'g', messageDeduplicationId: 'd4' },
+      ]);
+      assert.deepEqual(
+        outcome.failed.map(failure => `${failure.id}:${failure.code}`).sort(),
+        [
+          'baddedup:InvalidParameterValue',
+          'badgroup:InvalidParameterValue',
+          'delay:InvalidParameterValue',
+          'nodedup:InvalidParameterValue',
+          'nogroup:MissingParameter',
+        ],
+      );
+      assert.ok(outcome.failed.every(failure => failure.senderFault));
+      assert.deepEqual(
+        outcome.successful.map(success => success.id),
+        ['fine'],
+      );
     });
   });
 }

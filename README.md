@@ -8,15 +8,15 @@
 </p>
 
 > [!NOTE]
-> **Status: `0.1.0` (`0.x`)**, in development and not yet published. The first
-> milestone covers the module (`SqsModule.forRoot()` / `forRootAsync()` /
-> `forFeature()`), logical queues and named clients, `@SqsHandler` with the full
-> Nest enhancer pipeline, the parameter decorators, error mapping with a
-> receive-count retry backoff, graceful shutdown, `SqsProducerService`, and the
-> testing utilities (`InMemorySqs`, `VirtualClock`, `SqsTestModule`). FIFO
-> ordering, batch handlers, the visibility heartbeat, the health indicator and
-> the `@nestjs/outbox` transport follow. The published package keeps
-> `"dependencies": {}`.
+> **Status: `0.1.0` (`0.x`)**, in development and not yet published. Built so
+> far: the module (`SqsModule.forRoot()` / `forRootAsync()` / `forFeature()`),
+> logical queues and named clients, `@SqsHandler` with the full Nest enhancer
+> pipeline, the parameter decorators, error mapping with a receive-count retry
+> backoff, FIFO queues with per-group ordering, the visibility heartbeat,
+> graceful shutdown, `SqsProducerService`, and the testing utilities
+> (`InMemorySqs`, FIFO queues included, `VirtualClock`, `SqsTestModule`). Batch
+> handlers, the handler timeout, the health indicator and the `@nestjs/outbox`
+> transport follow. The published package keeps `"dependencies": {}`.
 
 ## What This Is
 
@@ -44,12 +44,19 @@ path from it.
   `ApproximateReceiveCount` — kept by SQS, so it survives restarts — and never
   below one second; the queue's redrive policy moves a message that keeps
   failing to its dead-letter queue.
+- **FIFO order under concurrency.** On a FIFO queue each message group runs
+  one message at a time, in order, while different groups run side by side; a
+  retry holds its group, so no later message overtakes the failed one.
+- **No message reappears mid-flight.** A heartbeat extends the visibility of
+  every message the consumer holds — running, or waiting behind its FIFO group
+  — within the 12 hours SQS allows from a receive.
 - **No silent stalls.** Every long poll runs under a deadline (the SDK sets no
   request timeout of its own), failed receives back off and retry, and a receive
   never asks for more messages than the consumer has room for.
-- **Graceful shutdown.** Stop receiving, release what the last poll returned,
-  drain what is running, release what outlives the drain — before any
-  `onApplicationShutdown` closes your database pools.
+- **Graceful shutdown.** Stop receiving, release what the last poll returned
+  and what waits behind a FIFO group, drain what is running, release what
+  outlives the drain — before any `onApplicationShutdown` closes your database
+  pools.
 - **Tests without AWS.** `InMemorySqs` has SQS's visibility semantics, refuses
   what SQS refuses, and runs on a virtual clock; the same contract spec runs
   against it and against a real endpoint.

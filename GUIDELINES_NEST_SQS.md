@@ -61,10 +61,12 @@ details hidden behind it. The bar: feel like a first-class Nest transport, drive
   return-deletes, the error mapper and the receive-count backoff, the bootstrap
   attribute read, the producer, `/testing`, the semantics contract, and graceful
   shutdown.
-- Milestone 2 (planned): FIFO per-group ordering, batch handlers with partial
-  failures, the visibility heartbeat and the handler timeout,
-  `SqsConsumerRegistry`, the health indicator, the `/outbox` transport for
-  `@nestjs/outbox`, the samples and the documentation site.
+- Milestone 2 (built so far): FIFO per-group ordering, with retry-then-release
+  and FIFO queues in `InMemorySqs` (group locking, the deduplication window,
+  sequence numbers), and the visibility heartbeat.
+- Milestone 2 (planned): batch handlers with partial failures, the handler
+  timeout, `SqsConsumerRegistry`, the health indicator, the `/outbox` transport
+  for `@nestjs/outbox`, the samples and the documentation site.
 - v0.1 does NOT ship: an explicit dead-letter move (the redrive policy is the
   dead-letter mechanism; the recipe below is the documented pattern), the SQS
   Extended Client (S3 payloads), automatic coalescing of `send()` calls, queue
@@ -93,18 +95,35 @@ Each is enforced by a test; a change to one updates its test in the same PR.
    Every receive runs under a deadline (`receiveTimeoutMs`), because the SDK
    sets no request timeout of its own.
 4. A receive never asks for more messages than the consumer has free permits;
-   a permit is held from receive to settle.
+   a permit is held from receive to settle, by a FIFO message waiting behind
+   an earlier one of its group as much as by a running one.
 5. A retry delay grows with `ApproximateReceiveCount` and never passes the
    12 hours SQS allows from the receive.
-6. Every batch response is checked entry by entry: a batch call returns HTTP
+6. On a FIFO queue, the held messages of one group run one at a time, in
+   receive order: a message starts only after the one before it finished and
+   SQS answered its delete. Different groups run concurrently. A `'retry'`
+   first sets the failed message's visibility (the backoff; nothing with
+   `retryBackoff: false`), and only once SQS answered does it release the
+   group's later held messages (visibility 0, batched): none of them may run
+   before SQS redelivers the failed message. A delete SQS refuses, automatic
+   or `ctx.delete()`, releases them the same way, because the message is still
+   in the queue.
+7. The heartbeat extends every held message — running, or waiting behind its
+   group — from receive to settle, and never past the 12 hours SQS allows from
+   the receive. A message's heartbeat stops, and the extension it has in
+   flight is answered, before the message is deleted, retried or released, so
+   no extension overtakes a settle; `ctx.changeVisibility()` stops it too.
+8. Every batch response is checked entry by entry: a batch call returns HTTP
    200 even when some of its entries failed.
-7. Shutdown order: stop receiving, release what the last receive returned,
-   drain (bounded by `drainTimeoutMs`), release what is still running, flush
-   every pending settle — all inside `beforeApplicationShutdown`.
-8. The in-memory SQS refuses every argument SQS refuses, with SQS's error code.
-   A new driver argument gets a case in the semantics contract, which runs
-   against both `InMemorySqs` and the real endpoint, in the same PR.
-9. The published package keeps `"dependencies": {}`.
+9. Shutdown order: stop receiving, release what the last receive returned,
+   release the held messages that have not started (FIFO messages waiting
+   behind their group), drain (bounded by `drainTimeoutMs`), release what is
+   still running, flush every pending settle — all inside
+   `beforeApplicationShutdown`.
+10. The in-memory SQS refuses every argument SQS refuses, with SQS's error code.
+    A new driver argument gets a case in the semantics contract, which runs
+    against both `InMemorySqs` and the real endpoint, in the same PR.
+11. The published package keeps `"dependencies": {}`.
 
 ### 6. Non-Negotiable Style & Patterns
 
@@ -225,7 +244,7 @@ exist fails the bootstrap, naming the handler. Any other failure — a missing
 `sqs:GetQueueAttributes` permission, typically — is warned about once, and the
 consumer falls back to its own `visibilityTimeout` option, which it then passes
 on every receive; without that option the visibility is unknown, and the
-heartbeat (milestone 2) stays off.
+heartbeat stays off, with one warning.
 
 **Shutdown drains in `beforeApplicationShutdown`.** NestJS completes each
 shutdown phase in every module before it starts the next, so a drain there
@@ -241,6 +260,31 @@ timeout expired. So stop waits for it (at most its deadline) and releases what
 it returned with visibility 0. `shutdown.abortReceive` trades that for speed;
 `SqsTestModule` sets it, so closing a test application never waits on the
 virtual clock.
+
+**FIFO: one message per group at a time, and a retry holds its group.** A
+receive returns as many messages of one group as it can, so a FIFO consumer
+holds a group's messages in a chain: the first runs, the rest wait, each
+holding its permit and its heartbeat, and the next runs once its predecessor
+settled. Different groups run side by side, up to `concurrency`. On a `'retry'`
+the failed message's visibility is set first and the rest of its chain is
+released after: SQS keeps a group locked while an earlier message of it is in
+flight, so the released messages wait behind the failed one and it is
+redelivered first. Releasing them before the backoff is set, or letting the next
+one run, would let a later message overtake it. Holding waiting messages as
+permits bounds memory and the heartbeat's work, at the cost of throughput when
+one group dominates a receive; `concurrency` is the knob.
+
+**The heartbeat covers every held message.** It is on by default, extending
+each held message by `extendBySeconds` (the visibility timeout) every
+`intervalSeconds` (half of it) from the receive, so a handler shorter than the
+interval costs no call. Waiting chain members are extended too: otherwise one
+could expire while its predecessors run and reach another consumer out of
+order. Each extension is clamped to the 12 hours SQS allows from the receive,
+because SQS refuses a longer visibility instead of shortening it; the extension
+that reaches the limit is the last, with a warning. A message's heartbeat is
+stopped, and its extension in flight awaited, before any settle, so an
+extension never lands after the delete or the retry visibility. The timers run
+on the `Clock` seam, so tests move virtual time instead of sleeping.
 
 **The producer never sets a message group on its own.** A `MessageGroupId` on a
 standard queue opts the message into fair queueing; the producer sends one only

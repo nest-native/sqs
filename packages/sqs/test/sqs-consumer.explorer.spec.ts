@@ -653,17 +653,38 @@ describe('bootstrap', () => {
     await moduleRef.close();
   });
 
-  it('refuses a FIFO queue, and invalid consumer options', async () => {
+  it('refuses invalid consumer options', async () => {
     const sqs = new InMemorySqs();
-    await assert.rejects(
-      bootWith(sqs, sqs.createDriverFactory(), { queues: { orders: 'http://sqs.in-memory.test/000000000000/orders.fifo' } }),
-      /consumes the FIFO queue "orders", which this version cannot consume yet/,
-    );
     queueWithRedrive(sqs, 'orders');
     await assert.rejects(
       bootWith(sqs, sqs.createDriverFactory(), { consumerDefaults: { waitTimeSeconds: 0 } }),
       /Invalid consumer options for Orders.handle: waitTimeSeconds must be/,
     );
+    await assert.rejects(
+      bootWith(sqs, sqs.createDriverFactory(), { consumerDefaults: { heartbeat: { intervalSeconds: 30 } } }),
+      /Invalid consumer options for Orders.handle: heartbeat.intervalSeconds \(30\) must be shorter than the visibility timeout \(30 s\)/,
+    );
+  });
+
+  it('turns the heartbeat off with one warning when the visibility timeout is unknown, and quietly on request', async () => {
+    const sqs = new InMemorySqs();
+    queueWithRedrive(sqs, 'orders');
+    sqs.deny('GetQueueAttributes');
+    const moduleRef = await bootWith(sqs, sqs.createDriverFactory());
+    const off = logs.warnings.filter(warning => /visibility heartbeat/.test(warning));
+    assert.deepEqual(off, [
+      'The visibility heartbeat of "orders" is off: the visibility timeout is unknown (the queue\'s attributes ' +
+        'could not be read and visibilityTimeout is not set); set visibilityTimeout to turn it on.',
+    ]);
+    await moduleRef.close();
+
+    logs.clear();
+    const quiet = await bootWith(sqs, sqs.createDriverFactory(), { consumerDefaults: { heartbeat: false } });
+    assert.deepEqual(
+      logs.warnings.filter(warning => /visibility heartbeat/.test(warning)),
+      [],
+    );
+    await quiet.close();
   });
 
   it('accepts a queue whose attributes leave the visibility out or garble it', async () => {
@@ -677,6 +698,215 @@ describe('bootstrap', () => {
       }));
       await moduleRef.close();
     }
+  });
+});
+
+describe('FIFO queues', () => {
+  function sendAll(sqs: InMemorySqs, queue: string, messages: [string, string][]): void {
+    for (const [body, groupId] of messages) {
+      sqs.sendMessage(queue, body, { groupId, deduplicationId: body });
+    }
+  }
+
+  it('runs one message of a group at a time, in order, and different groups at once', async () => {
+    const events: string[] = [];
+    const active = new Map<string, number>();
+    let mostAtOnceInAGroup = 0;
+
+    @Injectable()
+    class Ledger {
+      @SqsHandler('ledger', { concurrency: 4 })
+      async post(@SqsMessage() body: string, @SqsCtx() context: SqsContext): Promise<void> {
+        const group = context.getGroupId() as string;
+        active.set(group, (active.get(group) ?? 0) + 1);
+        mostAtOnceInAGroup = Math.max(mostAtOnceInAGroup, active.get(group) as number);
+        events.push(`start:${body}`);
+        await flush(2);
+        events.push(`end:${body}`);
+        active.set(group, (active.get(group) as number) - 1);
+      }
+    }
+
+    const { moduleRef, sqs } = await boot({ providers: [Ledger] }, { queues: { ledger: 'ledger.fifo' } });
+    sendAll(sqs, 'ledger.fifo', [
+      ['a1', 'a'],
+      ['b1', 'b'],
+      ['a2', 'a'],
+      ['b2', 'b'],
+      ['a3', 'a'],
+    ]);
+    await sqs.idle();
+
+    const finished = (group: string) => events.filter(event => event.startsWith(`end:${group}`));
+    assert.deepEqual(finished('a'), ['end:a1', 'end:a2', 'end:a3']);
+    assert.deepEqual(finished('b'), ['end:b1', 'end:b2']);
+    assert.equal(mostAtOnceInAGroup, 1);
+    assert.ok(events.indexOf('start:b1') < events.indexOf('end:a1'), 'the groups ran at the same time');
+    assert.deepEqual(sqs.messages('ledger.fifo'), []);
+    await moduleRef.close();
+  });
+
+  it('redelivers a failed message before the ones behind it, without holding other groups', async () => {
+    const handled: string[] = [];
+
+    @Injectable()
+    class Ledger {
+      @SqsHandler('ledger', { concurrency: 4 })
+      post(@SqsMessage() body: string, @SqsCtx() context: SqsContext): void {
+        handled.push(`${body}#${context.getReceiveCount()}`);
+        if (body === 'a2' && context.getReceiveCount() === 1) {
+          throw new Error('a2 failed');
+        }
+      }
+    }
+
+    const { moduleRef, sqs, clock } = await boot(
+      { providers: [Ledger] },
+      { queues: { ledger: 'ledger.fifo' }, retryBackoff: { initialDelaySeconds: 2, jitter: 'none' } },
+    );
+    sendAll(sqs, 'ledger.fifo', [
+      ['a1', 'a'],
+      ['b1', 'b'],
+      ['a2', 'a'],
+      ['b2', 'b'],
+      ['a3', 'a'],
+    ]);
+    await sqs.idle();
+    assert.deepEqual(
+      handled.filter(entry => entry.startsWith('b')),
+      ['b1#1', 'b2#1'],
+      'group b finished while a2 waits out its backoff',
+    );
+    assert.deepEqual(
+      handled.filter(entry => entry.startsWith('a')),
+      ['a1#1', 'a2#1'],
+    );
+    const a3 = sqs.messages('ledger.fifo').find(message => message.body === 'a3');
+    assert.equal(a3?.visible, true, 'a3 was released, not run');
+
+    await clock.advance(2_000);
+    await sqs.idle();
+    assert.deepEqual(
+      handled.filter(entry => entry.startsWith('a')),
+      ['a1#1', 'a2#1', 'a2#2', 'a3#2'],
+    );
+    assert.deepEqual(sqs.messages('ledger.fifo'), []);
+    await moduleRef.close();
+  });
+
+  it('releases the messages waiting behind a running one when shutdown begins, then drains it', async () => {
+    const gate = deferred<void>();
+    const handled: string[] = [];
+
+    @Injectable()
+    class Ledger {
+      @SqsHandler('ledger', { concurrency: 3 })
+      async post(@SqsMessage() body: string): Promise<void> {
+        handled.push(body);
+        await gate.promise;
+      }
+    }
+
+    const { moduleRef, sqs } = await boot({ providers: [Ledger] }, { queues: { ledger: 'ledger.fifo' } });
+    sendAll(sqs, 'ledger.fifo', [
+      ['g1', 'g'],
+      ['g2', 'g'],
+      ['g3', 'g'],
+    ]);
+    await flush();
+    assert.deepEqual(handled, ['g1']);
+
+    const closing = moduleRef.close();
+    await flush(20);
+    assert.deepEqual(
+      sqs.messages('ledger.fifo').map(message => [message.body, message.inFlight, message.visible]),
+      [
+        ['g1', true, false],
+        ['g2', false, true],
+        ['g3', false, true],
+      ],
+      'released while g1 still runs',
+    );
+    gate.resolve();
+    await closing;
+    assert.deepEqual(handled, ['g1']);
+    assert.deepEqual(
+      sqs.messages('ledger.fifo').map(message => message.body),
+      ['g2', 'g3'],
+      'g1 finished and was deleted; g2 and g3 wait for another consumer',
+    );
+  });
+});
+
+describe('the visibility heartbeat', () => {
+  async function until(condition: () => boolean): Promise<void> {
+    for (let round = 0; round < 100 && !condition(); round += 1) {
+      await flush();
+    }
+    assert.ok(condition(), 'the condition never held');
+  }
+
+  it('keeps the message of a long handler, and the ones waiting behind it, invisible', async () => {
+    const gate = deferred<void>();
+    const handled: string[] = [];
+
+    @Injectable()
+    class Slow {
+      @SqsHandler('slow', { concurrency: 2 })
+      async handle(@SqsMessage() body: string, @SqsCtx() context: SqsContext): Promise<void> {
+        handled.push(`${body}#${context.getReceiveCount()}`);
+        if (body === 's1') {
+          await gate.promise;
+        }
+      }
+    }
+
+    const prepared = new InMemorySqs();
+    prepared.createQueue('slow.fifo', { FifoQueue: 'true', VisibilityTimeout: '10' });
+    const { moduleRef, sqs, clock } = await boot({ providers: [Slow] }, { sqs: prepared, queues: { slow: 'slow.fifo' } });
+    sqs.sendMessage('slow.fifo', 's1', { groupId: 's', deduplicationId: 's1' });
+    sqs.sendMessage('slow.fifo', 's2', { groupId: 's', deduplicationId: 's2' });
+    await flush();
+    for (let second = 0; second < 60; second += 1) {
+      await clock.advance(1_000);
+    }
+    assert.deepEqual(
+      sqs.messages('slow.fifo').map(message => [message.body, message.visible, message.receiveCount]),
+      [
+        ['s1', false, 1],
+        ['s2', false, 1],
+      ],
+      'a minute later, six times the visibility timeout, neither is visible',
+    );
+    assert.deepEqual(handled, ['s1#1']);
+
+    gate.resolve();
+    await until(() => sqs.messages('slow.fifo').length === 0);
+    assert.deepEqual(handled, ['s1#1', 's2#1']);
+    await moduleRef.close();
+  });
+
+  it('leaves the message of a long handler to become visible again when turned off', async () => {
+    const gate = deferred<void>();
+
+    @Injectable()
+    class Slow {
+      @SqsHandler('slow', { heartbeat: false })
+      async handle(): Promise<void> {
+        await gate.promise;
+      }
+    }
+
+    const prepared = new InMemorySqs();
+    queueWithRedrive(prepared, 'slow', { VisibilityTimeout: '10' });
+    const { moduleRef, sqs, clock } = await boot({ providers: [Slow] }, { sqs: prepared });
+    sqs.sendMessage('slow', 'x');
+    await flush();
+    await clock.advance(10_000);
+    assert.equal(sqs.messages('slow')[0].visible, true);
+    gate.resolve();
+    await until(() => sqs.messages('slow').length === 0);
+    await moduleRef.close();
   });
 });
 

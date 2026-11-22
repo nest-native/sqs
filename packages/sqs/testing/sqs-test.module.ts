@@ -7,7 +7,10 @@ import { InMemorySqs } from './in-memory-sqs';
 export type SqsTestModuleOptions = Omit<SqsModuleOptions, 'driverFactory' | 'clock'> & {
   /**
    * The SQS to run against. Defaults to a fresh `InMemorySqs` that creates a
-   * queue the first time a name is resolved.
+   * queue the first time a name is resolved: a FIFO queue when the name ends
+   * in `.fifo`, a standard queue otherwise. Create the queues yourself, and
+   * pass the instance here, to give them attributes (a visibility timeout, a
+   * redrive policy, content-based deduplication).
    */
   sqs?: InMemorySqs;
 };
